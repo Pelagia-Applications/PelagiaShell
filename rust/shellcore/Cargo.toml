@@ -1,0 +1,8 @@
+[package]
+name = "shellcore"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "shellcore"
+path = "src/lib.rs"
