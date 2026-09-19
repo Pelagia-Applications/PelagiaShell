@@ -119,6 +119,82 @@ std::string base64Decode(const std::string& input) {
     return output;
 }
 
+std::string uuEncode(const std::string& input) {
+    std::string output;
+    output.reserve(input.size() * 2 + 8);
+
+    for (std::size_t i = 0; i < input.size(); i += 3) {
+        const std::size_t remaining = input.size() - i;
+        const std::size_t chunkLen = std::min<std::size_t>(remaining, 3u);
+
+        const unsigned char b0 = static_cast<unsigned char>(input[i]);
+        const unsigned char b1 = chunkLen > 1 ? static_cast<unsigned char>(input[i + 1]) : 0;
+        const unsigned char b2 = chunkLen > 2 ? static_cast<unsigned char>(input[i + 2]) : 0;
+
+        const unsigned char a = static_cast<unsigned char>((b0 >> 2) & 0x3F) + 0x20;
+        const unsigned char b = static_cast<unsigned char>(((b0 & 0x03) << 4) | ((b1 >> 4) & 0x0F)) + 0x20;
+        const unsigned char c = static_cast<unsigned char>(((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03)) + 0x20;
+        const unsigned char d = static_cast<unsigned char>(b2 & 0x3F) + 0x20;
+
+        output.push_back(static_cast<char>(chunkLen + 0x20));
+        output.push_back(static_cast<char>(a));
+        output.push_back(static_cast<char>(b));
+        output.push_back(static_cast<char>(c));
+        output.push_back(static_cast<char>(d));
+        output.push_back('\n');
+    }
+
+    output += "`\n";
+    return output;
+}
+
+std::string uuDecode(const std::string& input) {
+    std::string cleaned;
+    cleaned.reserve(input.size());
+    for (char ch : input) {
+        if (ch == '\r' || ch == '\n') {
+            continue;
+        }
+        cleaned.push_back(ch);
+    }
+
+    if (cleaned.empty()) {
+        return "";
+    }
+
+    std::string output;
+    for (std::size_t i = 0; i < cleaned.size(); i += 5) {
+        if (i + 4 >= cleaned.size()) {
+            break;
+        }
+
+        const unsigned char length = static_cast<unsigned char>(cleaned[i]) - 0x20;
+        if (length == 0) {
+            break;
+        }
+
+        const unsigned char a = static_cast<unsigned char>(cleaned[i + 1]) - 0x20;
+        const unsigned char b = static_cast<unsigned char>(cleaned[i + 2]) - 0x20;
+        const unsigned char c = static_cast<unsigned char>(cleaned[i + 3]) - 0x20;
+        const unsigned char d = static_cast<unsigned char>(cleaned[i + 4]) - 0x20;
+
+        const unsigned char byte0 = static_cast<unsigned char>((a << 2) | (b >> 4));
+        output.push_back(static_cast<char>(byte0));
+
+        if (length >= 2) {
+            const unsigned char byte1 = static_cast<unsigned char>(((b & 0x0F) << 4) | (c >> 2));
+            output.push_back(static_cast<char>(byte1));
+        }
+
+        if (length >= 3) {
+            const unsigned char byte2 = static_cast<unsigned char>(((c & 0x03) << 6) | d);
+            output.push_back(static_cast<char>(byte2));
+        }
+    }
+
+    return output;
+}
+
 std::uint32_t sha256RoTR(std::uint32_t value, std::uint32_t amount) {
     return (value >> amount) | (value << (32u - amount));
 }
@@ -241,6 +317,7 @@ bool Command::isBuiltin() const {
            name_ == "banner" || name_ == "mkdir" || name_ == "rmdir" ||
            name_ == "touch" || name_ == "cat" || name_ == "clear" || name_ == "date" ||
            name_ == "whoami" || name_ == "uname" || name_ == "rand" || name_ == "random" ||
+           name_ == "dice" || name_ == "coinflip" || name_ == "uud" ||
            name_ == "sha256" || name_ == "sha256file" || name_ == "b64encode" || name_ == "b64decode";
 }
 
@@ -410,6 +487,37 @@ int Command::execute() const {
         return 0;
     }
 
+    if (name_ == "dice") {
+        long long sides = 6;
+        if (!arguments_.empty()) {
+            try {
+                sides = std::stoll(arguments_[0]);
+            } catch (const std::exception&) {
+                std::cerr << "Usage: dice [sides]\n";
+                return 1;
+            }
+        }
+
+        if (sides <= 0) {
+            std::cerr << "dice: sides must be greater than zero\n";
+            return 1;
+        }
+
+        static std::random_device rd;
+        static std::mt19937_64 generator(rd());
+        std::uniform_int_distribution<long long> dist(1, sides);
+        std::cout << dist(generator) << '\n';
+        return 0;
+    }
+
+    if (name_ == "coinflip") {
+        static std::random_device rd;
+        static std::mt19937_64 generator(rd());
+        std::uniform_int_distribution<int> dist(0, 1);
+        std::cout << (dist(generator) == 0 ? "Heads" : "Tails") << '\n';
+        return 0;
+    }
+
     if (name_ == "rand" || name_ == "random") {
         if (arguments_.size() != 2) {
             std::cerr << "Usage: rand <min> <max>\n";
@@ -427,6 +535,34 @@ int Command::execute() const {
             return 0;
         } catch (const std::exception&) {
             std::cerr << "Usage: rand <min> <max>\n";
+            return 1;
+        }
+    }
+
+    if (name_ == "uud") {
+        if (arguments_.empty()) {
+            std::cerr << "Usage: uud [-e|-d] <text>\n";
+            return 1;
+        }
+
+        try {
+            const std::string mode = arguments_[0];
+            const std::string value = arguments_.size() > 1 ? joinArguments(std::vector<std::string>(arguments_.begin() + 1, arguments_.end())) : "";
+
+            if (mode == "-d" || mode == "--decode") {
+                std::cout << uuDecode(value) << '\n';
+                return 0;
+            }
+
+            if (mode == "-e" || mode == "--encode") {
+                std::cout << uuEncode(value) << '\n';
+                return 0;
+            }
+
+            std::cout << uuEncode(joinArguments(arguments_)) << '\n';
+            return 0;
+        } catch (const std::exception& ex) {
+            std::cerr << "uud: " << ex.what() << '\n';
             return 1;
         }
     }
@@ -522,7 +658,7 @@ int Command::execute() const {
     }
 
     if (name_ == "help") {
-        std::cout << "PelagiaShell builtins: echo, cd, pwd, ls, mkdir, rmdir, touch, cat, clear, date, whoami, uname, rand, random, b64encode, b64decode, about, theme, motd, banner, help, exit\n";
+        std::cout << "PelagiaShell builtins: echo, cd, pwd, ls, mkdir, rmdir, touch, cat, clear, date, whoami, uname, rand, random, dice, coinflip, uud, b64encode, b64decode, about, theme, motd, banner, help, exit\n";
         return 0;
     }
 
