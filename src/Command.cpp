@@ -18,11 +18,27 @@
 #ifdef _WIN32
 #include <direct.h>
 #include <ctime>
+#include <windows.h>
 #else
 #include <unistd.h>
 #endif
 
 namespace {
+std::wstring toWide(const std::string& text) {
+    if (text.empty()) {
+        return L"";
+    }
+
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (size <= 0) {
+        return L"";
+    }
+
+    std::wstring result(static_cast<std::size_t>(size) - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, result.data(), size);
+    return result;
+}
+
 std::string joinArguments(const std::vector<std::string>& arguments) {
     std::string result;
     for (std::size_t i = 0; i < arguments.size(); ++i) {
@@ -317,7 +333,7 @@ bool Command::isBuiltin() const {
            name_ == "banner" || name_ == "mkdir" || name_ == "rmdir" ||
            name_ == "touch" || name_ == "cat" || name_ == "clear" || name_ == "date" ||
            name_ == "whoami" || name_ == "uname" || name_ == "rand" || name_ == "random" ||
-           name_ == "dice" || name_ == "coinflip" || name_ == "uud" ||
+           name_ == "dice" || name_ == "coinflip" || name_ == "uud" || name_ == "weather" ||
            name_ == "sha256" || name_ == "sha256file" || name_ == "b64encode" || name_ == "b64decode";
 }
 
@@ -567,6 +583,76 @@ int Command::execute() const {
         }
     }
 
+    if (name_ == "weather") {
+        std::filesystem::path projectRoot = std::filesystem::current_path();
+        std::filesystem::path scriptPath = projectRoot / "scripts" / "weather.py";
+
+        if (!std::filesystem::exists(scriptPath)) {
+            std::filesystem::path altPath = projectRoot.parent_path() / "scripts" / "weather.py";
+            if (std::filesystem::exists(altPath)) {
+                scriptPath = altPath;
+            }
+        }
+
+        if (!std::filesystem::exists(scriptPath)) {
+            std::cerr << "weather: script not found at " << scriptPath << "\n";
+            return 1;
+        }
+
+#ifdef _WIN32
+        std::filesystem::path pythonPath = std::filesystem::path("C:/Users/Tayo Fatox/AppData/Local/Programs/Python/Python313/python.exe");
+        pythonPath = pythonPath.make_preferred();
+        std::wstring python = toWide(pythonPath.string());
+        std::wstring script = toWide(scriptPath.make_preferred().string());
+        std::wstring commandLine = L"\"" + python + L"\" \"" + script + L"\"";
+        for (const auto& arg : arguments_) {
+            commandLine += L" \"" + toWide(arg) + L"\"";
+        }
+
+        std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+        mutableCommand.push_back(L'\0');
+
+        STARTUPINFOW startupInfo{};
+        startupInfo.cb = sizeof(startupInfo);
+        PROCESS_INFORMATION processInfo{};
+
+        const BOOL created = CreateProcessW(
+            python.c_str(),
+            mutableCommand.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            0,
+            nullptr,
+            nullptr,
+            &startupInfo,
+            &processInfo
+        );
+
+        if (!created) {
+            const DWORD error = GetLastError();
+            std::cerr << "weather: unable to launch Python interpreter (error " << error << ")\n";
+            return 1;
+        }
+
+        WaitForSingleObject(processInfo.hProcess, INFINITE);
+        DWORD exitCode = 0;
+        GetExitCodeProcess(processInfo.hProcess, &exitCode);
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+        return static_cast<int>(exitCode);
+#else
+        std::string pythonExe = "/usr/bin/python3";
+        std::string command = "\"" + pythonExe + "\" \"" + scriptPath.string() + "\"";
+        for (const auto& arg : arguments_) {
+            command += " \"" + arg + "\"";
+        }
+
+        const int result = std::system(command.c_str());
+        return result;
+#endif
+    }
+
     if (name_ == "sha256" || name_ == "sha256file") {
         if (arguments_.empty()) {
             std::cerr << "Usage: sha256 <text|file>\n";
@@ -658,7 +744,7 @@ int Command::execute() const {
     }
 
     if (name_ == "help") {
-        std::cout << "PelagiaShell builtins: echo, cd, pwd, ls, mkdir, rmdir, touch, cat, clear, date, whoami, uname, rand, random, dice, coinflip, uud, b64encode, b64decode, about, theme, motd, banner, help, exit\n";
+        std::cout << "PelagiaShell builtins: echo, cd, pwd, ls, mkdir, rmdir, touch, cat, clear, date, whoami, uname, rand, random, dice, coinflip, uud, weather, b64encode, b64decode, about, theme, motd, banner, help, exit\n";
         return 0;
     }
 
