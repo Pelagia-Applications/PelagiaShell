@@ -1,4 +1,5 @@
 #include "Command.hpp"
+#include "Process.hpp"
 #include "Theme.hpp"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -48,6 +50,22 @@ std::string joinArguments(const std::vector<std::string>& arguments) {
     return result;
 }
 
+std::string escapeShellArgument(const std::string& input) {
+    std::string escaped;
+    escaped.reserve(input.size() + 2);
+    escaped.push_back('"');
+
+    for (const char ch : input) {
+        if (ch == '"' || ch == '\\' || ch == '$' || ch == '`') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(ch);
+    }
+
+    escaped.push_back('"');
+    return escaped;
+}
+
 std::string trim(const std::string& input) {
     const auto begin = input.find_first_not_of(" \t\r\n");
     if (begin == std::string::npos) {
@@ -56,6 +74,29 @@ std::string trim(const std::string& input) {
 
     const auto end = input.find_last_not_of(" \t\r\n");
     return input.substr(begin, end - begin + 1);
+}
+
+std::string stripAnsiCodes(const std::string& input) {
+    std::string output;
+    output.reserve(input.size());
+
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '\x1b' && i + 1 < input.size()) {
+            if (input[i + 1] == '[') {
+                i += 2;
+                while (i < input.size() && (input[i] < '@' || input[i] > '~')) {
+                    ++i;
+                }
+                if (i < input.size()) {
+                    continue;
+                }
+                break;
+            }
+        }
+        output.push_back(input[i]);
+    }
+
+    return output;
 }
 
 std::string normalizeWhitespace(const std::string& input) {
@@ -75,6 +116,178 @@ std::string normalizeWhitespace(const std::string& input) {
     }
 
     return trim(output);
+}
+
+std::string captureCommandOutput(const std::vector<std::string>& tokens) {
+    if (tokens.empty()) {
+        return "";
+    }
+
+    std::ostringstream captured;
+    const std::streambuf* original = std::cout.rdbuf(captured.rdbuf());
+    const int status = Process().run(Command(tokens));
+    std::cout.flush();
+    std::cout.rdbuf(const_cast<std::streambuf*>(original));
+
+    if (status != 0) {
+        return "";
+    }
+
+    std::string output = captured.str();
+    if (!output.empty() && output.back() == '\n') {
+        output.pop_back();
+    }
+    return trim(output);
+}
+
+std::vector<std::string> resolveCommandChainArguments(const std::vector<std::string>& arguments, const std::string& currentName) {
+    std::vector<std::string> resolved = arguments;
+    for (std::size_t i = 0; i < resolved.size(); ++i) {
+        const std::string& arg = resolved[i];
+        if (arg.empty() || arg[0] == '"' || arg[0] == '\'') {
+            continue;
+        }
+
+        const std::vector<std::string> candidateTokens = { arg };
+        const Command candidate(candidateTokens);
+        if (!candidate.isBuiltin() || candidate.name() == currentName) {
+            continue;
+        }
+
+        const std::string substituted = captureCommandOutput(candidateTokens);
+        if (!substituted.empty()) {
+            resolved[i] = substituted;
+        }
+    }
+    return resolved;
+}
+
+std::vector<std::string> splitDelimitedLine(const std::string& line, char delimiter) {
+    std::vector<std::string> fields;
+    std::string current;
+    bool inQuotes = false;
+
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        const char ch = line[i];
+        if (ch == '"') {
+            if (inQuotes && i + 1 < line.size() && line[i + 1] == '"') {
+                current.push_back('"');
+                ++i;
+            } else {
+                inQuotes = !inQuotes;
+            }
+            continue;
+        }
+
+        if (ch == delimiter && !inQuotes) {
+            fields.push_back(current);
+            current.clear();
+            continue;
+        }
+
+        current.push_back(ch);
+    }
+
+    fields.push_back(current);
+    return fields;
+}
+
+std::vector<std::vector<std::string>> parseTableData(const std::string& input, char delimiter) {
+    std::vector<std::vector<std::string>> rows;
+    std::istringstream stream(input);
+    std::string line;
+
+    while (std::getline(stream, line)) {
+        if (trim(line).empty()) {
+            continue;
+        }
+        rows.push_back(splitDelimitedLine(line, delimiter));
+    }
+
+    return rows;
+}
+
+std::string truncateCell(const std::string& value, std::size_t width) {
+    if (value.size() <= width) {
+        return value;
+    }
+
+    if (width <= 3) {
+        return value.substr(0, width);
+    }
+
+    return value.substr(0, width - 3) + "...";
+}
+
+std::string padCell(const std::string& value, std::size_t width) {
+    std::string padded = value;
+    if (padded.size() < width) {
+        padded.append(width - padded.size(), ' ');
+    }
+    return padded;
+}
+
+std::string renderAnsiGrid(const std::vector<std::vector<std::string>>& rows, std::size_t maxColumns, std::size_t limit, bool colorEnabled) {
+    if (rows.empty()) {
+        return "(no data)\n";
+    }
+
+    std::vector<std::size_t> widths(maxColumns, 0);
+    for (const auto& row : rows) {
+        for (std::size_t col = 0; col < maxColumns; ++col) {
+            const std::string cell = (col < row.size()) ? row[col] : "";
+            widths[col] = std::max(widths[col], std::min<std::size_t>(std::max<std::size_t>(cell.size(), 1), 28u));
+        }
+    }
+
+    const std::string reset = "\033[0m";
+    const std::string blue = colorEnabled ? "\033[38;5;45m" : "";
+    const std::string cyan = colorEnabled ? "\033[38;5;117m" : "";
+    const std::string dim = colorEnabled ? "\033[38;5;245m" : "";
+    const std::string accent = colorEnabled ? "\033[38;5;220m" : "";
+    const std::string headerBg = colorEnabled ? "\033[48;5;24m" : "";
+
+    std::ostringstream output;
+    auto printBorder = [&](const char left, const char mid, const char right) {
+        output << left;
+        for (std::size_t col = 0; col < maxColumns; ++col) {
+            output << std::string(widths[col] + 2, '-') << (col + 1 == maxColumns ? right : mid);
+        }
+        output << '\n';
+    };
+
+    printBorder('+', '+', '+');
+
+    std::size_t visibleRows = 0;
+    for (std::size_t rowIndex = 0; rowIndex < rows.size() && (limit == 0 || visibleRows < limit); ++rowIndex) {
+        const auto& row = rows[rowIndex];
+        const bool headerRow = rowIndex == 0;
+
+        output << (headerRow ? (headerBg + blue) : (rowIndex % 2 == 0 ? dim : accent));
+        output << '|';
+        for (std::size_t col = 0; col < maxColumns; ++col) {
+            const std::string value = (col < row.size()) ? row[col] : "";
+            const std::string display = truncateCell(value, widths[col]);
+            output << ' ' << padCell(display, widths[col]) << ' ' << '|';
+        }
+        output << reset << '\n';
+        ++visibleRows;
+
+        if (headerRow) {
+            output << (headerBg + cyan);
+            output << '|';
+            for (std::size_t col = 0; col < maxColumns; ++col) {
+                output << ' ' << padCell("", widths[col]) << ' ' << '|';
+            }
+            output << reset << '\n';
+        }
+    }
+
+    printBorder('+', '+', '+');
+    if (rows.size() > visibleRows) {
+        output << "... truncated\n";
+    }
+    return output.str();
 }
 
 std::string commandOutput(const std::string& command) {
@@ -407,8 +620,8 @@ bool Command::isBuiltin() const {
            name_ == "touch" || name_ == "cat" || name_ == "clear" || name_ == "date" ||
            name_ == "whoami" || name_ == "uname" || name_ == "rand" || name_ == "random" ||
            name_ == "dice" || name_ == "coinflip" || name_ == "uud" || name_ == "weather" ||
-           name_ == "specs" || name_ == "sha256" || name_ == "sha256file" ||
-           name_ == "b64encode" || name_ == "b64decode";
+           name_ == "specs" || name_ == "req" || name_ == "gridview" || name_ == "grid" || name_ == "gv" ||
+           name_ == "sha256" || name_ == "sha256file" || name_ == "b64encode" || name_ == "b64decode";
 }
 
 int Command::execute() const {
@@ -761,7 +974,8 @@ int Command::execute() const {
             return 1;
         }
 
-        const std::string value = joinArguments(arguments_);
+        const std::vector<std::string> resolved = resolveCommandChainArguments(arguments_, name_);
+        const std::string value = joinArguments(resolved);
         std::cout << base64Encode(value) << '\n';
         return 0;
     }
@@ -773,7 +987,8 @@ int Command::execute() const {
         }
 
         try {
-            const std::string value = joinArguments(arguments_);
+            const std::vector<std::string> resolved = resolveCommandChainArguments(arguments_, name_);
+            const std::string value = joinArguments(resolved);
             const std::string decoded = base64Decode(value);
             std::cout << decoded << '\n';
             return 0;
@@ -917,6 +1132,288 @@ int Command::execute() const {
         return 0;
     }
 
+    if (name_ == "req") {
+        if (arguments_.empty()) {
+            std::cerr << "Usage: req <url> [-X METHOD] [-H \"Header: value\"] [-d DATA]\n";
+            return 1;
+        }
+
+        std::string method = "GET";
+        std::string data;
+        std::string url;
+        std::vector<std::string> headers;
+
+        for (std::size_t i = 0; i < arguments_.size(); ++i) {
+            const std::string& arg = arguments_[i];
+            if (arg == "-X" || arg == "--request") {
+                if (i + 1 >= arguments_.size()) {
+                    std::cerr << "req: missing request method\n";
+                    return 1;
+                }
+                method = arguments_[++i];
+            } else if (arg == "-H" || arg == "--header") {
+                if (i + 1 >= arguments_.size()) {
+                    std::cerr << "req: missing header value\n";
+                    return 1;
+                }
+                headers.push_back(arguments_[++i]);
+            } else if (arg == "-d" || arg == "--data" || arg == "--data-raw") {
+                if (i + 1 >= arguments_.size()) {
+                    std::cerr << "req: missing request data\n";
+                    return 1;
+                }
+                data = arguments_[++i];
+            } else if (arg == "-L" || arg == "--location") {
+                continue;
+            } else if (url.empty()) {
+                url = arg;
+            } else {
+                data = joinArguments(std::vector<std::string>(arguments_.begin() + static_cast<std::ptrdiff_t>(i), arguments_.end()));
+                break;
+            }
+        }
+
+        if (url.empty()) {
+            std::cerr << "Usage: req <url> [-X METHOD] [-H \"Header: value\"] [-d DATA]\n";
+            return 1;
+        }
+
+        std::string command = "curl -sS -L";
+        if (method != "GET") {
+            command += " -X " + escapeShellArgument(method);
+        }
+        for (const auto& header : headers) {
+            command += " -H " + escapeShellArgument(header);
+        }
+        if (!data.empty()) {
+            command += " --data " + escapeShellArgument(data);
+        }
+        command += " " + escapeShellArgument(url);
+
+        const int curlStatus = std::system(command.c_str());
+        if (curlStatus == 0) {
+            return 0;
+        }
+
+#ifdef _WIN32
+        const std::string pythonExe = "python";
+#else
+        const std::string pythonExe = "/usr/bin/env python3";
+#endif
+
+        std::string pythonCommand = "";
+        pythonCommand += pythonExe + " -c \"import json, sys, urllib.request, urllib.error; "
+            "url = sys.argv[1]; method = sys.argv[2] if len(sys.argv) > 2 else 'GET'; data = sys.argv[3] if len(sys.argv) > 3 else None; "
+            "headers = {}; "
+            "for item in sys.argv[4:]: headers[item.split(':', 1)[0].strip()] = item.split(':', 1)[1].strip() if ':' in item else ''; "
+            "req = urllib.request.Request(url, data=(data.encode() if isinstance(data, str) else None), headers=headers, method=method); "
+            "try: response = urllib.request.urlopen(req, timeout=15); body = response.read().decode('utf-8', 'replace'); print(body, end=''); "
+            "except Exception as exc: print(str(exc), file=sys.stderr); raise SystemExit(1)\" " + escapeShellArgument(url) + " " + escapeShellArgument(method);
+
+        if (!data.empty()) {
+            pythonCommand += " " + escapeShellArgument(data);
+        }
+        for (const auto& header : headers) {
+            pythonCommand += " " + escapeShellArgument(header);
+        }
+
+        return std::system(pythonCommand.c_str());
+    }
+
+    if (name_ == "gridview" || name_ == "grid" || name_ == "gv") {
+        if (arguments_.empty()) {
+            std::cerr << "Usage: gridview [--no-color] [--limit N] [--sep ,|;|tab] <csv|tsv|file|command>\n";
+            return 1;
+        }
+
+        bool colorEnabled = true;
+        std::size_t limit = 0;
+        char delimiter = ',';
+        std::string source;
+
+        for (std::size_t i = 0; i < arguments_.size(); ++i) {
+            const std::string& arg = arguments_[i];
+            if (arg == "--no-color") {
+                colorEnabled = false;
+            } else if (arg == "--limit" || arg == "-l") {
+                if (i + 1 >= arguments_.size()) {
+                    std::cerr << "gridview: missing limit value\n";
+                    return 1;
+                }
+                try {
+                    limit = static_cast<std::size_t>(std::stoul(arguments_[++i]));
+                } catch (const std::exception&) {
+                    std::cerr << "gridview: invalid limit value\n";
+                    return 1;
+                }
+            } else if (arg == "--sep" || arg == "-s") {
+                if (i + 1 >= arguments_.size()) {
+                    std::cerr << "gridview: missing separator value\n";
+                    return 1;
+                }
+                const std::string sepArg = arguments_[++i];
+                if (sepArg == "tab" || sepArg == "\t") {
+                    delimiter = '\t';
+                } else if (sepArg == ";") {
+                    delimiter = ';';
+                } else if (sepArg == "|") {
+                    delimiter = '|';
+                } else if (sepArg == "," || sepArg == "csv") {
+                    delimiter = ',';
+                } else {
+                    delimiter = sepArg[0];
+                }
+            } else if (source.empty()) {
+                source = arg;
+            } else {
+                source += " " + arg;
+            }
+        }
+
+        if (source.empty()) {
+            std::cerr << "Usage: gridview [--no-color] [--limit N] [--sep ,|;|tab] <csv|tsv|file|command>\n";
+            return 1;
+        }
+
+        std::string content;
+        const std::filesystem::path candidate = std::filesystem::path(source);
+        if (std::filesystem::exists(candidate) && std::filesystem::is_regular_file(candidate)) {
+            std::ifstream input(candidate, std::ios::binary);
+            if (!input) {
+                std::cerr << "gridview: unable to open file: " << source << '\n';
+                return 1;
+            }
+            std::ostringstream buffer;
+            buffer << input.rdbuf();
+            content = stripAnsiCodes(buffer.str());
+        } else {
+            const std::string maybeCommand = trim(source);
+            const bool looksLikeData = maybeCommand.find(',') != std::string::npos || maybeCommand.find('\t') != std::string::npos || maybeCommand.find(';') != std::string::npos || maybeCommand.find('\n') != std::string::npos;
+            if (!looksLikeData) {
+                content = stripAnsiCodes(commandOutput(maybeCommand));
+            } else {
+                content = maybeCommand;
+            }
+        }
+
+        if (trim(content).empty()) {
+            std::cout << "(no data)\n";
+            return 0;
+        }
+
+        std::filesystem::path tempDir = std::filesystem::temp_directory_path();
+        std::filesystem::path tempCsv = tempDir / ("pelagia_gridview_" + std::to_string(std::time(nullptr)) + ".csv");
+        std::ofstream tempFile(tempCsv, std::ios::binary);
+        if (!tempFile) {
+            std::cerr << "gridview: unable to create temporary data file\n";
+            return 1;
+        }
+        tempFile << content;
+        tempFile.close();
+
+#ifdef _WIN32
+        std::vector<std::filesystem::path> pythonCandidates = {
+            std::filesystem::path("C:/Users/Tayo Fatox/AppData/Local/Programs/Python/Python313/pythonw.exe"),
+            std::filesystem::path("C:/Users/Tayo Fatox/AppData/Local/Programs/Python/Python313/python.exe"),
+            std::filesystem::path("C:/Windows/System32/pythonw.exe"),
+            std::filesystem::path("C:/Windows/System32/python.exe")
+        };
+
+        std::filesystem::path pythonPath;
+        for (const auto& candidate : pythonCandidates) {
+            if (std::filesystem::exists(candidate)) {
+                pythonPath = candidate;
+                break;
+            }
+        }
+
+        if (pythonPath.empty()) {
+            pythonPath = std::filesystem::path("python");
+        }
+
+        const std::filesystem::path projectRoot = std::filesystem::current_path();
+        std::filesystem::path scriptPath = projectRoot / "scripts" / "gridview_gui.py";
+        if (!std::filesystem::exists(scriptPath)) {
+            const std::filesystem::path altScript = projectRoot.parent_path() / "scripts" / "gridview_gui.py";
+            if (std::filesystem::exists(altScript)) {
+                scriptPath = altScript;
+            }
+        }
+
+        if (!std::filesystem::exists(scriptPath)) {
+            std::cerr << "gridview: script not found at " << scriptPath << '\n';
+            std::filesystem::remove(tempCsv);
+            return 1;
+        }
+
+        const std::string delimiterArg = delimiter == '\t' ? "tab" : std::string(1, delimiter);
+        const std::string themeArg = currentTheme();
+        const std::wstring pythonWide = toWide(pythonPath.make_preferred().string());
+        const std::wstring scriptWide = toWide(scriptPath.make_preferred().string());
+        const std::wstring csvWide = toWide(tempCsv.make_preferred().string());
+        const std::wstring delimiterWide = toWide(delimiterArg);
+        const std::wstring themeWide = toWide(themeArg);
+        const std::wstring titleWide = toWide("PelagiaShell GridView");
+
+        std::wstring commandLine = L"\"" + pythonWide + L"\" \"" + scriptWide + L"\" --csv \"" + csvWide + L"\" --delimiter \"" + delimiterWide + L"\" --title \"" + titleWide + L"\" --theme \"" + themeWide + L"\"";
+        std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+        mutableCommand.push_back(L'\0');
+
+        STARTUPINFOW startupInfo{};
+        startupInfo.cb = sizeof(startupInfo);
+        PROCESS_INFORMATION processInfo{};
+        const BOOL created = CreateProcessW(
+            nullptr,
+            mutableCommand.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_DEFAULT_ERROR_MODE,
+            nullptr,
+            nullptr,
+            &startupInfo,
+            &processInfo
+        );
+
+        if (!created) {
+            const DWORD error = GetLastError();
+            std::cerr << "gridview: unable to launch GUI window (CreateProcess failed, error " << error << ")\n";
+            return 1;
+        }
+
+        CloseHandle(processInfo.hThread);
+        std::thread([processHandle = processInfo.hProcess, csvPath = tempCsv]() {
+            if (processHandle != nullptr) {
+                WaitForSingleObject(processHandle, INFINITE);
+                CloseHandle(processHandle);
+            }
+            std::filesystem::remove(csvPath);
+        }).detach();
+
+        return 0;
+#else
+        std::string pythonExe = "/usr/bin/env python3";
+
+        const std::filesystem::path projectRoot = std::filesystem::current_path();
+        std::filesystem::path scriptPath = projectRoot / "scripts" / "gridview_gui.py";
+        if (!std::filesystem::exists(scriptPath)) {
+            const std::filesystem::path altScript = projectRoot.parent_path() / "scripts" / "gridview_gui.py";
+            if (std::filesystem::exists(altScript)) {
+                scriptPath = altScript;
+            }
+        }
+
+        const std::string delimiterArg = delimiter == '\t' ? "tab" : std::string(1, delimiter);
+        const std::string themeArg = currentTheme();
+        std::string command = "";
+        command += pythonExe + " " + escapeShellArgument(scriptPath.string()) + " --csv " + escapeShellArgument(tempCsv.string()) + " --delimiter " + escapeShellArgument(delimiterArg) + " --title " + escapeShellArgument("PelagiaShell GridView") + " --theme " + escapeShellArgument(themeArg);
+
+        const int scriptStatus = std::system(command.c_str());
+        std::filesystem::remove(tempCsv);
+        return scriptStatus;
+#endif
+    }
+
     if (name_ == "theme") {
         if (arguments_.empty()) {
             std::cout << "Current theme: " << themeLabel(currentTheme()) << '\n';
@@ -952,7 +1449,7 @@ int Command::execute() const {
     }
 
     if (name_ == "help") {
-        std::cout << "PelagiaShell builtins: echo, cd, pwd, ls, mkdir, rmdir, touch, cat, clear, date, whoami, uname, rand, random, dice, coinflip, uud, weather, specs, b64encode, b64decode, about, theme, motd, banner, help, exit\n";
+        std::cout << "PelagiaShell builtins: echo, cd, pwd, ls, mkdir, rmdir, touch, cat, clear, date, whoami, uname, rand, random, dice, coinflip, uud, weather, specs, req, gridview, grid, gv, b64encode, b64decode, about, theme, motd, banner, help, exit\n";
         return 0;
     }
 

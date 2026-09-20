@@ -3,3 +3,4 @@ build/
 demo/
 /scripts/.env
 gitpusher.sh
+/scripts/__pycache__/
