@@ -1,6 +1,7 @@
 #include "Command.hpp"
 #include "Theme.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -45,6 +46,78 @@ std::string joinArguments(const std::vector<std::string>& arguments) {
         result += arguments[i] + (i + 1 < arguments.size() ? " " : "");
     }
     return result;
+}
+
+std::string trim(const std::string& input) {
+    const auto begin = input.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return "";
+    }
+
+    const auto end = input.find_last_not_of(" \t\r\n");
+    return input.substr(begin, end - begin + 1);
+}
+
+std::string normalizeWhitespace(const std::string& input) {
+    std::string output;
+    bool previousWasSpace = false;
+
+    for (const char ch : input) {
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+            if (!output.empty() && !previousWasSpace) {
+                output.push_back(' ');
+                previousWasSpace = true;
+            }
+        } else {
+            output.push_back(ch);
+            previousWasSpace = false;
+        }
+    }
+
+    return trim(output);
+}
+
+std::string commandOutput(const std::string& command) {
+    std::string output;
+#ifdef _WIN32
+    FILE* pipe = _popen(command.c_str(), "r");
+#else
+    FILE* pipe = popen(command.c_str(), "r");
+#endif
+    if (!pipe) {
+        return "";
+    }
+
+    char buffer[4096];
+    while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    return output;
+}
+
+std::string firstMeaningfulLine(const std::string& text) {
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const std::string cleaned = normalizeWhitespace(line);
+        if (!cleaned.empty() && cleaned != "Name" && cleaned != "Name " && cleaned != "VALUE" && cleaned != "TotalPhysicalMemory") {
+            return cleaned;
+        }
+    }
+    return "Unknown";
+}
+
+std::string formatBytesToGiB(std::uint64_t bytes) {
+    const double gigabytes = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(2) << gigabytes << " GiB";
+    return stream.str();
 }
 
 std::string base64Encode(const std::string& input) {
@@ -334,7 +407,8 @@ bool Command::isBuiltin() const {
            name_ == "touch" || name_ == "cat" || name_ == "clear" || name_ == "date" ||
            name_ == "whoami" || name_ == "uname" || name_ == "rand" || name_ == "random" ||
            name_ == "dice" || name_ == "coinflip" || name_ == "uud" || name_ == "weather" ||
-           name_ == "sha256" || name_ == "sha256file" || name_ == "b64encode" || name_ == "b64decode";
+           name_ == "specs" || name_ == "sha256" || name_ == "sha256file" ||
+           name_ == "b64encode" || name_ == "b64decode";
 }
 
 int Command::execute() const {
@@ -709,6 +783,140 @@ int Command::execute() const {
         }
     }
 
+    if (name_ == "specs") {
+        std::string cpu = "Unknown";
+        std::string gpu = "Unknown";
+        std::string ram = "Unknown";
+        std::string storage = "Unknown";
+        std::string motherboard = "Unknown";
+
+#ifdef _WIN32
+        cpu = firstMeaningfulLine(commandOutput("powershell -NoProfile -Command \"(Get-CimInstance Win32_Processor).Name\" 2>nul"));
+        if (cpu == "Unknown") {
+            cpu = firstMeaningfulLine(commandOutput("wmic cpu get Name 2>nul | findstr /V \"Name\""));
+        }
+
+        gpu = firstMeaningfulLine(commandOutput("powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController).Name\" 2>nul"));
+        if (gpu == "Unknown") {
+            gpu = firstMeaningfulLine(commandOutput("wmic path win32_VideoController get Name 2>nul | findstr /V \"Name\""));
+        }
+
+        const std::string ramRaw = firstMeaningfulLine(commandOutput("powershell -NoProfile -Command \"(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory\" 2>nul"));
+        try {
+            if (ramRaw != "Unknown") {
+                const std::uint64_t bytes = std::stoull(ramRaw);
+                ram = formatBytesToGiB(bytes);
+            }
+        } catch (const std::exception&) {
+            ram = "Unknown";
+        }
+
+        storage = firstMeaningfulLine(commandOutput("powershell -NoProfile -Command \"Get-CimInstance Win32_DiskDrive | Select-Object -First 1 @{Name='DiskInfo';Expression={ $_.Model + ' (' + [math]::Round($_.Size / 1GB, 2) + ' GiB)' }} | Select-Object -ExpandProperty DiskInfo\" 2>nul"));
+        if (storage == "Unknown") {
+            storage = firstMeaningfulLine(commandOutput("wmic DiskDrive get Model,Size 2>nul | findstr /V \"Model Size\""));
+        }
+        if (storage == "Unknown" || storage == "Windows") {
+            storage = firstMeaningfulLine(commandOutput("powershell -NoProfile -Command \"Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -eq 3 } | Select-Object -First 1 @{Name='DriveInfo';Expression={ $_.DeviceID + ' ' + [math]::Round($_.Size / 1GB, 2) + ' GiB' }} | Select-Object -ExpandProperty DriveInfo\" 2>nul"));
+        }
+
+        motherboard = firstMeaningfulLine(commandOutput("powershell -NoProfile -Command \"(Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product | Format-Table -HideTableHeaders | Out-String).Trim()\" 2>nul"));
+        if (motherboard == "Unknown") {
+            motherboard = firstMeaningfulLine(commandOutput("wmic baseboard get Product,Manufacturer 2>nul | findstr /V \"Product Manufacturer\""));
+        }
+#else
+#ifdef __APPLE__
+        cpu = firstMeaningfulLine(commandOutput("sysctl -n machdep.cpu.brand_string 2>/dev/null"));
+        gpu = firstMeaningfulLine(commandOutput("system_profiler SPDisplaysDataType 2>/dev/null | grep 'Chipset' | head -n 1"));
+        if (gpu == "Unknown") {
+            gpu = firstMeaningfulLine(commandOutput("system_profiler SPDisplaysDataType 2>/dev/null | grep 'Displays:' -A 20 | tail -n +2 | head -n 1"));
+        }
+
+        const std::string memRaw = firstMeaningfulLine(commandOutput("sysctl -n hw.memsize 2>/dev/null"));
+        try {
+            if (memRaw != "Unknown") {
+                ram = formatBytesToGiB(std::stoull(memRaw));
+            }
+        } catch (const std::exception&) {
+            ram = "Unknown";
+        }
+
+        storage = firstMeaningfulLine(commandOutput("system_profiler SPStorageDataType 2>/dev/null | grep 'Capacity' | head -n 1"));
+        if (storage == "Unknown") {
+            storage = firstMeaningfulLine(commandOutput("df -h / 2>/dev/null | tail -n +2 | head -n 1"));
+        }
+
+        motherboard = firstMeaningfulLine(commandOutput("sysctl -n hw.model 2>/dev/null"));
+#else
+        std::ifstream cpuInfo("/proc/cpuinfo");
+        if (cpuInfo) {
+            std::string line;
+            while (std::getline(cpuInfo, line)) {
+                if (line.rfind("model name", 0) == 0 || line.rfind("Hardware", 0) == 0 || line.rfind("Processor", 0) == 0) {
+                    const std::size_t colon = line.find(':');
+                    if (colon != std::string::npos) {
+                        cpu = normalizeWhitespace(line.substr(colon + 1));
+                        break;
+                    }
+                }
+            }
+        }
+
+        gpu = firstMeaningfulLine(commandOutput("lspci 2>/dev/null | grep -iE 'vga|3d|display' | head -n 1"));
+        if (gpu == "Unknown") {
+            gpu = firstMeaningfulLine(commandOutput("glxinfo -B 2>/dev/null | grep -i 'OpenGL renderer string' | head -n 1"));
+        }
+
+        std::ifstream memInfo("/proc/meminfo");
+        if (memInfo) {
+            std::string line;
+            while (std::getline(memInfo, line)) {
+                if (line.rfind("MemTotal:", 0) == 0) {
+                    const std::size_t colon = line.find(':');
+                    if (colon != std::string::npos) {
+                        const std::string value = trim(line.substr(colon + 1));
+                        const std::size_t space = value.find(' ');
+                        if (space != std::string::npos) {
+                            try {
+                                const std::uint64_t kb = std::stoull(value.substr(0, space));
+                                ram = formatBytesToGiB(kb * 1024ULL);
+                            } catch (const std::exception&) {
+                                ram = "Unknown";
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        storage = firstMeaningfulLine(commandOutput("lsblk -dn -o NAME,SIZE 2>/dev/null | head -n 1"));
+        if (storage == "Unknown") {
+            storage = firstMeaningfulLine(commandOutput("df -h / 2>/dev/null | tail -n +2 | head -n 1"));
+        }
+
+        std::ifstream vendorFile("/sys/class/dmi/id/board_vendor");
+        std::ifstream productFile("/sys/class/dmi/id/board_name");
+        std::string vendor, product;
+        if (vendorFile) { std::getline(vendorFile, vendor); }
+        if (productFile) { std::getline(productFile, product); }
+        vendor = trim(vendor);
+        product = trim(product);
+        if (!vendor.empty() || !product.empty()) {
+            motherboard = vendor + (vendor.empty() || product.empty() ? "" : " ") + product;
+        }
+#endif
+#endif
+
+        const std::string accent = themeColorCode(currentTheme());
+        std::cout << accent << "System Specs\n" << "\033[0m";
+        std::cout << accent << "CPU: " << "\033[0m" << cpu << '\n';
+        std::cout << accent << "GPU: " << "\033[0m" << gpu << '\n';
+        std::cout << accent << "RAM: " << "\033[0m" << ram << '\n';
+        std::cout << accent << "Storage: " << "\033[0m" << storage << '\n';
+        std::cout << accent << "Motherboard: " << "\033[0m" << motherboard << '\n';
+        return 0;
+    }
+
     if (name_ == "theme") {
         if (arguments_.empty()) {
             std::cout << "Current theme: " << themeLabel(currentTheme()) << '\n';
@@ -744,7 +952,7 @@ int Command::execute() const {
     }
 
     if (name_ == "help") {
-        std::cout << "PelagiaShell builtins: echo, cd, pwd, ls, mkdir, rmdir, touch, cat, clear, date, whoami, uname, rand, random, dice, coinflip, uud, weather, b64encode, b64decode, about, theme, motd, banner, help, exit\n";
+        std::cout << "PelagiaShell builtins: echo, cd, pwd, ls, mkdir, rmdir, touch, cat, clear, date, whoami, uname, rand, random, dice, coinflip, uud, weather, specs, b64encode, b64decode, about, theme, motd, banner, help, exit\n";
         return 0;
     }
 

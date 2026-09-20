@@ -2,3 +2,4 @@ demo/
 build/
 gitpusher.sh
 /scripts/.env
+.venv/
