@@ -1,5 +1,5 @@
-demo/
-build/
-gitpusher.sh
-/scripts/.env
 .venv/
+build/
+demo/
+/scripts/.env
+gitpusher.sh
